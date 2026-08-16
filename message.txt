@@ -1,0 +1,426 @@
+import {
+  SlashCommandBuilder,
+  PermissionFlagsBits,
+  ChannelType,
+  ActionRowBuilder,
+  StringSelectMenuBuilder,
+  MessageFlags,
+} from 'discord.js';
+
+import { createEmbed, successEmbed } from '../../utils/embeds.js';
+import { saveTicketPanelOpData } from '../../utils/database/ticketPanelOp.js';
+import { InteractionHelper } from '../../utils/interactionHelper.js';
+import { logger } from '../../utils/logger.js';
+import {
+  handleInteractionError,
+  replyUserError,
+  ErrorTypes,
+  createError,
+} from '../../utils/errorHandler.js';
+
+const TYPE_EMOJIS = ['🎫', '📋', '💬', '🛠️', '⚠️'];
+const HEX_COLOR_REGEX = /^#?[0-9a-fA-F]{6}$/;
+
+function addTypeOptionPair(subcommand, index, required = false) {
+  subcommand
+    .addStringOption((option) =>
+      option
+        .setName(`type${index}_name`)
+        .setDescription(`Name shown in the dropdown for ticket type ${index}.`)
+        .setMaxLength(80)
+        .setRequired(required),
+    )
+    .addRoleOption((option) =>
+      option
+        .setName(`type${index}_role`)
+        .setDescription(`Support role for ticket type ${index}.`)
+        .setRequired(required),
+    );
+
+  return subcommand;
+}
+
+const data = new SlashCommandBuilder()
+  .setName('ticketpanelop')
+  .setDescription(
+    'Creates a professional support-ticket panel with a customizable dropdown.',
+  )
+  .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels)
+  .setDMPermission(false)
+  .addSubcommand((subcommand) => {
+    subcommand
+      .setName('setup')
+      .setDescription('Posts a new ticket panel with a dropdown of ticket types.')
+
+      .addChannelOption((option) =>
+        option
+          .setName('channel')
+          .setDescription('Channel where the ticket panel will be posted.')
+          .addChannelTypes(
+            ChannelType.GuildText,
+            ChannelType.GuildAnnouncement,
+          )
+          .setRequired(true),
+      )
+
+      .addStringOption((option) =>
+        option
+          .setName('title')
+          .setDescription('Title for the ticket panel.')
+          .setMaxLength(256)
+          .setRequired(true),
+      )
+
+      .addStringOption((option) =>
+        option
+          .setName('description')
+          .setDescription('Description for the ticket panel.')
+          .setMaxLength(2000)
+          .setRequired(true),
+      );
+
+    addTypeOptionPair(subcommand, 1, true);
+    addTypeOptionPair(subcommand, 2, false);
+    addTypeOptionPair(subcommand, 3, false);
+    addTypeOptionPair(subcommand, 4, false);
+    addTypeOptionPair(subcommand, 5, false);
+
+    subcommand
+      .addChannelOption((option) =>
+        option
+          .setName('category')
+          .setDescription('Category where tickets will be created.')
+          .addChannelTypes(ChannelType.GuildCategory)
+          .setRequired(false),
+      )
+
+      .addStringOption((option) =>
+        option
+          .setName('color')
+          .setDescription('Hex color, for example #5865F2.')
+          .setMaxLength(7)
+          .setRequired(false),
+      )
+
+      .addStringOption((option) =>
+        option
+          .setName('placeholder')
+          .setDescription('Text shown before selecting a ticket type.')
+          .setMaxLength(100)
+          .setRequired(false),
+      );
+
+    return subcommand;
+  });
+
+export default {
+  data,
+
+  async execute(interaction, guildConfig, client) {
+    const deferred = await InteractionHelper.safeDefer(interaction, {
+      flags: MessageFlags.Ephemeral,
+    });
+
+    if (!deferred) return;
+
+    try {
+      if (!interaction.guild) {
+        return await replyUserError(interaction, {
+          type: ErrorTypes.VALIDATION,
+          message: 'This command can only be used inside a server.',
+        });
+      }
+
+      const subcommand = interaction.options.getSubcommand();
+
+      if (subcommand !== 'setup') {
+        return;
+      }
+
+      if (
+        !interaction.memberPermissions?.has(
+          PermissionFlagsBits.ManageChannels,
+        )
+      ) {
+        return await replyUserError(interaction, {
+          type: ErrorTypes.PERMISSION,
+          message:
+            'You need the `Manage Channels` permission to set up a ticket panel.',
+        });
+      }
+
+      const channel = interaction.options.getChannel('channel');
+      const title = interaction.options.getString('title');
+      const description = interaction.options.getString('description');
+      const category = interaction.options.getChannel('category');
+      const colorInput = interaction.options.getString('color');
+      const placeholder =
+        interaction.options.getString('placeholder') ||
+        'Select a ticket type...';
+
+      if (!channel) {
+        return await replyUserError(interaction, {
+          type: ErrorTypes.VALIDATION,
+          message: 'Please select a valid channel.',
+        });
+      }
+
+      if (!title || !description) {
+        return await replyUserError(interaction, {
+          type: ErrorTypes.VALIDATION,
+          message: 'Title and description are required.',
+        });
+      }
+
+      let normalizedColor = null;
+
+      if (colorInput) {
+        const trimmedColor = colorInput.trim();
+
+        if (!HEX_COLOR_REGEX.test(trimmedColor)) {
+          return await replyUserError(interaction, {
+            type: ErrorTypes.VALIDATION,
+            message:
+              'Color must be a valid hex code, for example `#5865F2`.',
+          });
+        }
+
+        normalizedColor = trimmedColor.startsWith('#')
+          ? trimmedColor
+          : `#${trimmedColor}`;
+      }
+
+      const types = [];
+      const seenNames = new Set();
+      const seenRoles = new Set();
+
+      for (let i = 1; i <= 5; i++) {
+        const name = interaction.options.getString(`type${i}_name`);
+        const role = interaction.options.getRole(`type${i}_role`);
+
+        /*
+         * Both fields must be provided together.
+         */
+        if (!name && !role) {
+          continue;
+        }
+
+        if (!name || !role) {
+          return await replyUserError(interaction, {
+            type: ErrorTypes.VALIDATION,
+            message: `Ticket type ${i} must have both a name and a support role.`,
+          });
+        }
+
+        const cleanName = name.trim();
+
+        if (!cleanName) {
+          return await replyUserError(interaction, {
+            type: ErrorTypes.VALIDATION,
+            message: `Ticket type ${i} cannot have an empty name.`,
+          });
+        }
+
+        const nameKey = cleanName.toLowerCase();
+
+        if (seenNames.has(nameKey)) {
+          return await replyUserError(interaction, {
+            type: ErrorTypes.VALIDATION,
+            message: `Ticket type names must be unique. "${cleanName}" is used more than once.`,
+          });
+        }
+
+        /*
+         * Prevent accidentally using the same support role
+         * for multiple ticket types.
+         */
+        if (seenRoles.has(role.id)) {
+          return await replyUserError(interaction, {
+            type: ErrorTypes.VALIDATION,
+            message: `The role ${role} is already assigned to another ticket type.`,
+          });
+        }
+
+        seenNames.add(nameKey);
+        seenRoles.add(role.id);
+
+        types.push({
+          name: cleanName,
+          roleId: role.id,
+          roleName: role.name,
+        });
+      }
+
+      if (types.length === 0) {
+        return await replyUserError(interaction, {
+          type: ErrorTypes.VALIDATION,
+          message:
+            'You must provide at least one ticket type with a name and support role.',
+        });
+      }
+
+      /*
+       * Make sure the bot can actually send messages
+       * to the selected channel.
+       */
+      const permissions = channel.permissionsFor(interaction.guild.members.me);
+
+      if (
+        !permissions?.has(PermissionFlagsBits.ViewChannel) ||
+        !permissions?.has(PermissionFlagsBits.SendMessages)
+      ) {
+        return await replyUserError(interaction, {
+          type: ErrorTypes.PERMISSION,
+          message:
+            'I need `View Channel` and `Send Messages` permissions in the selected channel.',
+        });
+      }
+
+      /*
+       * Build embed.
+       */
+      const panelEmbed = createEmbed({
+        title,
+        description,
+        color: normalizedColor || 'info',
+        fields: [
+          {
+            name: 'Ticket Types',
+            value: types
+              .map(
+                (type, index) =>
+                  `${TYPE_EMOJIS[index] || '🎫'} **${type.name}** — <@&${type.roleId}>`,
+              )
+              .join('\n'),
+          },
+        ],
+        footer: {
+          text: 'Select an option below to open a ticket',
+        },
+      });
+
+      /*
+       * Build dropdown.
+       */
+      const selectMenu = new StringSelectMenuBuilder()
+        .setCustomId('ticketpanelop_select')
+        .setPlaceholder(placeholder)
+        .setMinValues(1)
+        .setMaxValues(1)
+        .addOptions(
+          types.map((type, index) => ({
+            label: type.name.slice(0, 100),
+            description: `Support role: ${type.roleName}`.slice(0, 100),
+            value: String(index),
+            emoji: TYPE_EMOJIS[index] || '🎫',
+          })),
+        );
+
+      const row = new ActionRowBuilder().addComponents(selectMenu);
+
+      let sentPanel;
+
+      try {
+        sentPanel = await channel.send({
+          embeds: [panelEmbed],
+          components: [row],
+        });
+      } catch (sendError) {
+        logger.error('Failed to send ticket panel', {
+          error: sendError,
+          guildId: interaction.guildId,
+          channelId: channel.id,
+        });
+
+        throw createError(
+          'Failed to send ticket panel',
+          ErrorTypes.DISCORD_API,
+          `Could not post the panel in ${channel}. Make sure the bot can view and send messages there.`,
+          {
+            channelId: channel.id,
+            guildId: interaction.guildId,
+            originalError: sendError?.message,
+          },
+        );
+      }
+
+      /*
+       * Save panel data.
+       */
+      try {
+        await saveTicketPanelOpData(
+          interaction.guildId,
+          sentPanel.id,
+          {
+            guildId: interaction.guildId,
+            channelId: channel.id,
+            messageId: sentPanel.id,
+            title,
+            description,
+            color: normalizedColor,
+            categoryId: category?.id || null,
+            types,
+            placeholder,
+            createdBy: interaction.user.id,
+            createdAt: new Date().toISOString(),
+          },
+        );
+      } catch (databaseError) {
+        /*
+         * The panel was already created, so report the
+         * database problem separately.
+         */
+        logger.error('Failed to save ticket panel data', {
+          error: databaseError,
+          guildId: interaction.guildId,
+          messageId: sentPanel.id,
+        });
+
+        throw createError(
+          'Failed to save ticket panel',
+          ErrorTypes.DATABASE,
+          'The ticket panel was posted, but I could not save its configuration to the database.',
+          {
+            guildId: interaction.guildId,
+            messageId: sentPanel.id,
+          },
+        );
+      }
+
+      const summaryLines = types
+        .map(
+          (type, index) =>
+            `${TYPE_EMOJIS[index] || '🎫'} **${type.name}** → <@&${type.roleId}>`,
+        )
+        .join('\n');
+
+      const categoryText = category
+        ? `\n\n**Ticket Category:** ${category}`
+        : '';
+
+      await InteractionHelper.safeEditReply(interaction, {
+        embeds: [
+          successEmbed(
+            'Ticket Panel Created',
+            `Your ticket panel is live in ${channel}.\n\n**Ticket Types:**\n${summaryLines}${categoryText}`,
+          ),
+        ],
+      });
+
+      logger.info('Ticket panel created successfully', {
+        command: 'ticketpanelop',
+        userId: interaction.user.id,
+        guildId: interaction.guildId,
+        channelId: channel.id,
+        messageId: sentPanel.id,
+        typeCount: types.length,
+        categoryId: category?.id || null,
+      });
+    } catch (error) {
+      await handleInteractionError(interaction, error, {
+        commandName: 'ticketpanelop',
+        source: 'ticketpanelop_setup',
+      });
+    }
+  },
+};
